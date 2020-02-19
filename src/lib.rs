@@ -1,12 +1,15 @@
 #![allow(dead_code)]
 #![deny(missing_debug_implementations)]
 
+pub mod export;
+
 use log::{debug, error, info, trace, warn};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::prelude::*;
 
-use std::convert::TryFrom;
-use std::io::SeekFrom;
+use std::convert::{TryFrom, TryInto};
+
+use export::{Export, ExportStore};
 
 const NBD_MAGIC: u64 = 0x4e42444d41474943;
 const CLISERV_MAGIC: u64 = 0x00420281861253;
@@ -25,7 +28,6 @@ fn oldstyle_handshake() {
     // write 124 bytes zeroes
 }
 
-#[derive(Debug)]
 struct Request {
     flags: u16,
     cmd: Command,
@@ -35,32 +37,47 @@ struct Request {
     data: Vec<u8>,
 }
 
-#[derive(Debug)]
-pub struct Server<T> {
-    con: T,
-    state: ClientState,
-
-    write_zeroes: bool,
-
-    export_name: String,
-
-    db: sled::Db,
+// Custom debug impl to properly format request bytes
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Request {{ flags: {:016b}, cmd: {:?}, handle: {}, offset: {}, length: {}, data: {} bytes }}", self.flags, self.cmd, self.handle, self.offset, self.length, self.data.len())
+    }
 }
 
-impl<T> Server<T>
+#[derive(Debug)]
+pub struct HandshakeCon<T, E> {
+    con: T,
+
+    write_zeroes: bool,
+    structured_replies: bool,
+
+    export_store: E,
+}
+
+#[derive(Debug)]
+pub struct ExportCon<T, E> {
+    con: T,
+
+    write_zeroes: bool,
+    structured_replies: bool,
+
+    export: E,
+}
+
+impl<T, E> HandshakeCon<T, E>
 where
     T: AsyncRead + AsyncWrite + Unpin,
+    E: ExportStore,
+    E::Error: Into<Error>,
 {
-    pub fn new(con: T, db: sled::Db) -> Self {
-        Server {
+    pub fn new(con: T, export_store: E) -> Self {
+        HandshakeCon {
             con,
-            state: ClientState::Handshake,
 
             write_zeroes: true,
+            structured_replies: false,
 
-            export_name: "".to_owned(),
-
-            db,
+            export_store,
         }
     }
 
@@ -68,13 +85,8 @@ where
         unimplemented!();
     }
 
-    pub async fn newstyle_handshake(&mut self) -> Result<Option<()>, Error> {
+    pub async fn newstyle_handshake(mut self) -> Result<Option<ExportCon<T, E::Export>>, Error> {
         let mut opt_data_buf = [0u8; 1024];
-
-        match self.state {
-            ClientState::Handshake => {}
-            _ => return Err(Error::HandshakeFinished),
-        }
 
         trace!("Sending newstyle handshake");
         self.con.write_u64(NBD_MAGIC).await?;
@@ -88,7 +100,7 @@ where
         if cl_flags & ClientHandShakeFlags::NoZeroes as u32 != 0 {
             self.write_zeroes = false;
         }
-        // TODO: close connection on unrecognized flags
+        // close connection on unrecognized flags
         if (cl_flags
             & !(ClientHandShakeFlags::FixedNewstyle as u32 | ClientHandShakeFlags::NoZeroes as u32))
             != 0
@@ -134,12 +146,17 @@ where
                     );
                     match &opt {
                         Options::ExportName => {
-                            let name =
-                                String::from_utf8_lossy(&opt_data_buf[..option_length as usize]);
-                            self.export_name = name.to_string();
+                            let name = String::from_utf8(
+                                (&opt_data_buf[..option_length as usize]).to_vec(),
+                            )?;
                             // TODO: such 1GB file
+                            let export = self
+                                .export_store
+                                .get_export(&name)
+                                .await
+                                .map_err(|e| e.into())?;
                             self.write_opt_export_reply(1024 * 1024 * 1024).await?;
-                            return Ok(Some(()));
+                            return Ok(Some(ExportCon::new(self, export.unwrap())));
                         }
                         Options::Abort => {
                             trace!("Dropping connection on client request");
@@ -161,8 +178,80 @@ where
                         // TODO: implement these
                         Options::PeekExport => self.write_unsupported_option(opt).await?,
                         Options::StartTLS => self.write_unsupported_option(opt).await?,
-                        Options::Info => self.write_unsupported_option(opt).await?,
-                        Options::Go => self.write_unsupported_option(opt).await?,
+                        Options::Info => {
+                            // TODO
+                            // length needs to be at least 6 bytes: 4 bytes name length, 0 length
+                            // empty name, 2 bytes number of information requests
+                            if option_length <= 6 {
+                                // TODO: invalid
+                            }
+                            let (length_bytes, data) = opt_data_buf.split_at(4);
+                            let name_length = u32::from_be_bytes(length_bytes.try_into()?);
+                            if name_length > option_length - 6 {
+                                // TODO: invalid
+                            }
+                            if option_length - 6 - name_length % 2 != 0 {
+                                // TODO: invalid
+                            }
+                            let (name_bytes, data) = data.split_at(name_length as usize);
+                            let name = String::from_utf8(name_bytes.to_vec())?;
+                            let (request_count_bytes, data) = data.split_at(2);
+                            let request_count = u16::from_be_bytes(request_count_bytes.try_into()?);
+                            if data.len() != request_count as usize * 2 {
+                                // TODO: invalid
+                            }
+                            let mut request_vec: Vec<InfoType> =
+                                Vec::with_capacity(request_count as usize);
+                            for idx in 0..request_count {
+                                request_vec.push(
+                                    u16::from_be_bytes(
+                                        data[idx as usize * 2..(idx + 1) as usize * 2]
+                                            .try_into()?,
+                                    )
+                                    .try_into()?,
+                                );
+                            }
+                            // TODO: handle requests
+                            self.write_unsupported_option(opt).await?;
+                        }
+                        Options::Go => {
+                            //TODO
+                            // length needs to be at least 6 bytes: 4 bytes name length, 0 length
+                            // empty name, 2 bytes number of information requests
+                            if option_length <= 6 {
+                                // TODO: invalid
+                            }
+                            let (length_bytes, data) = opt_data_buf.split_at(4);
+                            let name_length = u32::from_be_bytes(length_bytes.try_into()?);
+                            if name_length > option_length - 6 {
+                                // TODO: invalid
+                            }
+                            if option_length - 6 - name_length % 2 != 0 {
+                                // TODO: invalid
+                            }
+                            let (name_bytes, data) = data.split_at(name_length as usize);
+                            let name = String::from_utf8(name_bytes.to_vec())?;
+                            let (request_count_bytes, data) = data.split_at(2);
+                            let request_count = u16::from_be_bytes(request_count_bytes.try_into()?);
+                            if data.len() != request_count as usize * 2 {
+                                // TODO: invalid
+                            }
+                            let mut request_vec: Vec<InfoType> =
+                                Vec::with_capacity(request_count as usize);
+                            for idx in 0..request_count {
+                                request_vec.push(
+                                    u16::from_be_bytes(
+                                        data[idx as usize * 2..(idx + 1) as usize * 2]
+                                            .try_into()?,
+                                    )
+                                    .try_into()?,
+                                );
+                            }
+                            for it in &request_vec {
+                                trace!("{:?}", it);
+                            }
+                            self.write_unsupported_option(opt).await?;
+                        }
                         Options::StructuredReply => self.write_unsupported_option(opt).await?,
                         Options::MetaContext => self.write_unsupported_option(opt).await?,
                         Options::SetMetaContext => self.write_unsupported_option(opt).await?,
@@ -179,87 +268,11 @@ where
         Ok(None)
     }
 
-    pub async fn serve_export(&mut self) -> Result<(), Error> {
-        info!("Serving export to client");
-        if self.export_name == "" {
-            return Err(Error::UnsupportedExport(self.export_name.clone()));
-        }
-
-        //let mut export = tokio::fs::File::create(&self.export_name).await?;
-        //export.set_len(1024 * 1024 * 1024).await?;
-
-        loop {
-            let req = self.read_request().await?;
-            trace!("Read request {:?}", req);
-            // TODO
-            match req.cmd {
-                Command::Read => {
-                    //export.seek(SeekFrom::Start(req.offset)).await?;
-                    //let mut contents = vec![0; req.length as usize];
-                    //export.read_exact(&mut contents[..]).await?;
-                    let contents = vec![0u8; req.length as usize];
-                    self.write_simple_reply(0, req.handle, Some(contents))
-                        .await?;
-                }
-                _ => {}
-            };
-        }
-    }
-
-    async fn write_simple_reply(
-        &mut self,
-        error: i32,
-        handle: u64,
-        data: Option<Vec<u8>>,
-    ) -> Result<(), Error> {
-        self.con.write_u32(SIMPLE_REPLY_MAGIC).await?;
-        self.con.write_i32(error).await?;
-        self.con.write_u64(handle).await?;
-        if let Some(data) = data {
-            debug!("Writing {} bytes to client", data.len());
-            self.con.write_all(&data[..]).await?;
-        };
-        Ok(())
-    }
-
-    async fn read_request(&mut self) -> Result<Request, Error> {
-        let magic = self.con.read_u32().await?;
-        if magic != REQUEST_MAGIC {
-            return Err(Error::InvalidRequestMagic(magic));
-        }
-        let flags = self.con.read_u16().await?;
-        let cmd = Command::try_from(self.con.read_u16().await?)?;
-        let handle = self.con.read_u64().await?;
-        let offset = self.con.read_u64().await?;
-        let length = self.con.read_u32().await?;
-        let data = if cmd == Command::Write {
-            let mut buf = vec![0; length as usize];
-            let read = self.con.read_exact(&mut buf[..]).await?;
-            if read != length as usize {
-                error!(
-                    "Mismatched read data length ({}) vs received ({})",
-                    read, length
-                );
-            }
-            buf
-        } else {
-            Vec::with_capacity(0)
-        };
-
-        Ok(Request {
-            flags,
-            cmd,
-            handle,
-            offset,
-            length,
-            data,
-        })
-    }
-
     async fn write_opt_export_reply(&mut self, size: u64) -> Result<(), Error> {
         // TODO proper flaggies
         let mut flags = ServerTransmissionFlags::HasFlags as u16;
         flags |= ServerTransmissionFlags::WriteZeroes as u16;
+        flags |= ServerTransmissionFlags::SendFlush as u16;
         self.con.write_u64(size).await?;
         self.con.write_u16(flags).await?;
 
@@ -312,6 +325,213 @@ where
         self.con.write_u32(optreply as u32).await?;
         self.con.write_u32(len).await?;
         Ok(())
+    }
+}
+
+impl<T, E> ExportCon<T, E>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+    E: Export,
+{
+    // We don't need to set the bound of S::Export: E, since we don't care about S
+    pub fn new<S>(hs: HandshakeCon<T, S>, export: E) -> ExportCon<T, E> {
+        ExportCon {
+            con: hs.con,
+
+            write_zeroes: hs.write_zeroes,
+            structured_replies: hs.structured_replies,
+
+            export,
+        }
+    }
+
+    pub async fn serve_export(&mut self) -> Result<(), Error> {
+        info!("Serving export to client");
+
+        // TODO
+        let export_len = 1024 * 1024 * 1024;
+
+        loop {
+            let req = self.read_request().await?;
+            trace!("Client sent {:?}", req);
+            // TODO
+            match req.cmd {
+                Command::Read => {
+                    // bounds check
+                    if req.offset + req.length as u64 > export_len {
+                        debug!("Sendig ENOSPC to client");
+                        self.write_simple_reply(NbdError::NoSpc, req.handle, None)
+                            .await?;
+                        continue;
+                    }
+
+                    let result = self
+                        .export
+                        .read(req.offset, req.offset + req.length as u64)
+                        .await;
+
+                    match result {
+                        Err(nbde) => {
+                            self.write_simple_reply(nbde.into(), req.handle, None)
+                                .await?
+                        }
+                        Ok(contents) => {
+                            self.write_simple_reply(NbdError::None, req.handle, Some(contents))
+                                .await?
+                        }
+                    };
+                }
+                Command::Write => {
+                    // bounds check
+                    if req.offset + req.length as u64 > export_len {
+                        debug!("Sendig ENOSPC to client");
+                        self.write_simple_reply(NbdError::NoSpc, req.handle, None)
+                            .await?;
+                        continue;
+                    }
+
+                    let err = self
+                        .export
+                        .write(req.offset, &req.data)
+                        .await
+                        .map_err(|e| e.into())
+                        .and::<()>(Err(NbdError::None))
+                        .unwrap_err();
+
+                    self.write_simple_reply(err, req.handle, None).await?;
+                }
+                Command::Disc => {
+                    info!("Disconnecting client");
+                    return Ok(());
+                }
+                Command::Flush => {
+                    if req.offset != 0 || req.length != 0 {
+                        self.write_simple_reply(NbdError::Inval, req.handle, None)
+                            .await?;
+                        continue;
+                    }
+
+                    let err = self
+                        .export
+                        .flush()
+                        .await
+                        .map_err(|e| e.into())
+                        .and::<()>(Err(NbdError::None))
+                        .unwrap_err();
+
+                    self.write_simple_reply(err, req.handle, None).await?;
+                }
+                Command::Trim => {
+                    // TODO
+                    warn!("Writing operation not supported to client");
+                    self.write_simple_reply(NbdError::NotSup, req.handle, None)
+                        .await?;
+                }
+                Command::Cache => {
+                    //TODO
+                    warn!("Writing operation not supported to client");
+                    self.write_simple_reply(NbdError::NotSup, req.handle, None)
+                        .await?;
+                }
+                // TODO
+                Command::WriteZeroes => {
+                    if req.offset != 0 || req.length != 0 {
+                        self.write_simple_reply(NbdError::Inval, req.handle, None)
+                            .await?;
+                        continue;
+                    }
+
+                    let err = self
+                        .export
+                        .write_zeroes(req.offset, req.offset + req.length as u64)
+                        .await
+                        .map_err(|e| e.into())
+                        .and::<()>(Err(NbdError::None))
+                        .unwrap_err();
+
+                    self.write_simple_reply(err, req.handle, None).await?;
+                }
+                Command::BlockStatus => {
+                    // TODO
+                    warn!("Writing operation not supported to client");
+                    self.write_simple_reply(NbdError::NotSup, req.handle, None)
+                        .await?;
+                }
+                Command::Resize => {
+                    // TODO
+                    warn!("Writing operation not supported to client");
+                    self.write_simple_reply(NbdError::NotSup, req.handle, None)
+                        .await?;
+                }
+            };
+        }
+    }
+
+    async fn write_structured_reply_chunk(
+        &mut self,
+        flags: u16,
+        typ: StructuredReplyTypes,
+        handle: u64,
+        payload: &[u8],
+    ) -> Result<(), Error> {
+        self.con.write_u32(STRUCTURED_REPLY_MAGIC).await?;
+        self.con.write_u16(flags).await?;
+        self.con.write_u16(typ as u16).await?;
+        self.con.write_u64(handle).await?;
+        self.con.write_u32(payload.len() as u32).await?;
+        if payload.is_empty() {
+            self.con.write_all(payload).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_simple_reply(
+        &mut self,
+        error: NbdError,
+        handle: u64,
+        data: Option<Vec<u8>>,
+    ) -> Result<(), Error> {
+        self.con.write_u32(SIMPLE_REPLY_MAGIC).await?;
+        self.con.write_i32(error as i32).await?;
+        self.con.write_u64(handle).await?;
+        if let Some(data) = data {
+            self.con.write_all(&data[..]).await?;
+        };
+        Ok(())
+    }
+
+    async fn read_request(&mut self) -> Result<Request, Error> {
+        let magic = self.con.read_u32().await?;
+        if magic != REQUEST_MAGIC {
+            return Err(Error::InvalidRequestMagic(magic));
+        }
+        let flags = self.con.read_u16().await?;
+        let cmd = Command::try_from(self.con.read_u16().await?)?;
+        let handle = self.con.read_u64().await?;
+        let offset = self.con.read_u64().await?;
+        let length = self.con.read_u32().await?;
+        let data = if cmd == Command::Write {
+            let mut buf = vec![0; length as usize];
+            let read = self.con.read_exact(&mut buf[..]).await?;
+            if read != length as usize {
+                error!(
+                    "Mismatched read data length ({}) vs received ({})",
+                    read, length
+                );
+            }
+            buf
+        } else {
+            Vec::with_capacity(0)
+        };
+
+        Ok(Request {
+            flags,
+            cmd,
+            handle,
+            offset,
+            length,
+            data,
+        })
     }
 }
 
@@ -407,15 +627,29 @@ enum OptionsReply {
     ErrTooBig = 1 << 31 | 9,
 }
 
-// TODO right size?
 #[repr(u16)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum InfoType {
     Export = 0,
     Name = 1,
     Description = 2,
     BlockSize = 3,
     MetaContext = 4,
+}
+
+impl TryFrom<u16> for InfoType {
+    type Error = Error;
+
+    fn try_from(u: u16) -> Result<Self, Self::Error> {
+        match u {
+            0 => Ok(InfoType::Export),
+            1 => Ok(InfoType::Name),
+            2 => Ok(InfoType::Description),
+            3 => Ok(InfoType::BlockSize),
+            4 => Ok(InfoType::MetaContext),
+            _ => Err(Error::UnknownInfoType(u)),
+        }
+    }
 }
 
 // #[repr(u32)]
@@ -502,9 +736,11 @@ impl TryFrom<u16> for Command {
 
 #[repr(i32)]
 #[derive(Debug)]
-enum NbdError {
+pub enum NbdError {
+    /// No error encountered during operation.
+    None = 0,
     /// Operation not permitted.
-    Perm = 0,
+    Perm = 1,
     /// Input/output error.
     Io = 5,
     /// Cannot allocate memory.
@@ -521,6 +757,12 @@ enum NbdError {
     ShutDown = 108,
 }
 
+impl From<std::io::Error> for NbdError {
+    fn from(e: std::io::Error) -> NbdError {
+        NbdError::Io
+    }
+}
+
 #[derive(Debug)]
 pub enum Error {
     Unknown,
@@ -528,12 +770,16 @@ pub enum Error {
     UnknownOption(u32),
     /// An unknown command.
     UnknownCommand(u16),
+    /// An unknown info type
+    UnknownInfoType(u16),
     UnrecognizedClientFlags(u32),
     UnsupportedExport(String),
     /// IO error while writing to the client / server connection.
     IO(std::io::ErrorKind),
     HandshakeFinished,
     InvalidRequestMagic(u32),
+    ConversionFailed,
+    NonUtf8Name,
 }
 
 impl std::fmt::Display for Error {
@@ -542,6 +788,7 @@ impl std::fmt::Display for Error {
             Error::Unknown => write!(f, "Unknown error"),
             Error::UnknownOption(opt) => write!(f, "Unknown option {}", opt),
             Error::UnknownCommand(cmd) => write!(f, "Unknown command {}", cmd),
+            Error::UnknownInfoType(it) => write!(f, "Unknown info type {}", it),
             Error::UnrecognizedClientFlags(flags) => {
                 write!(f, "Unknown client flags {:032b}", flags)
             }
@@ -552,6 +799,8 @@ impl std::fmt::Display for Error {
                 "Try to perform handshake action, but handshake already finsihed"
             ),
             Error::InvalidRequestMagic(magic) => write!(f, "Got invalid request magic {}", magic),
+            Error::ConversionFailed => write!(f, "Failed to convert byte slice"),
+            Error::NonUtf8Name => write!(f, "Export name is not valid utf-8"),
         }
     }
 }
@@ -562,9 +811,22 @@ impl From<std::io::Error> for Error {
     }
 }
 
+impl From<std::array::TryFromSliceError> for Error {
+    fn from(_: std::array::TryFromSliceError) -> Error {
+        Error::ConversionFailed
+    }
+}
+
+impl From<std::string::FromUtf8Error> for Error {
+    fn from(_: std::string::FromUtf8Error) -> Error {
+        Error::NonUtf8Name
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Command;
+    use super::InfoType;
     use super::Options;
     use std::convert::TryFrom;
 
@@ -600,5 +862,17 @@ mod tests {
         assert!(Command::try_from(9).is_err());
         assert!(Command::try_from(15).is_err());
         assert!(Command::try_from(177).is_err());
+    }
+
+    #[test]
+    fn info_type_from_u16() {
+        assert_eq!(InfoType::try_from(0).unwrap(), InfoType::Export);
+        assert_eq!(InfoType::try_from(1).unwrap(), InfoType::Name);
+        assert_eq!(InfoType::try_from(2).unwrap(), InfoType::Description);
+        assert_eq!(InfoType::try_from(3).unwrap(), InfoType::BlockSize);
+        assert_eq!(InfoType::try_from(4).unwrap(), InfoType::MetaContext);
+        assert!(InfoType::try_from(9).is_err());
+        assert!(InfoType::try_from(15).is_err());
+        assert!(InfoType::try_from(177).is_err());
     }
 }

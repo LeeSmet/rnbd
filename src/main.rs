@@ -7,19 +7,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut listener = TcpListener::bind("127.0.0.1:10809").await?;
 
     let db = sled::open("test.db")?;
+    let store = rnbd::export::TmpStore::default();
 
     loop {
         let (socket, _) = listener.accept().await?;
 
-        let mut server = rnbd::Server::new(socket, db.clone());
+        let hs = rnbd::HandshakeCon::new(socket, store.clone());
         tokio::spawn(async move {
-            let handshake_result = server.newstyle_handshake().await;
+            let handshake_result = hs.newstyle_handshake().await;
             let cl = handshake_result.unwrap_or_else(|e| {
                 info!("Hanshake error {:?}", e);
                 None
             });
-            if cl.is_some() {
-                if let Err(e) = server.serve_export().await {
+            if let Some(mut ec) = cl {
+                if let Err(e) = ec.serve_export().await {
                     info!("Export serving error {:?}", e);
                 };
             }
