@@ -8,6 +8,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db = sled::open("test.db")?;
     let store = rnbd::export::TmpStore::default();
+    // let db_store = rnbd::export::SledStore::new(db);
 
     loop {
         let (socket, _) = listener.accept().await?;

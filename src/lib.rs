@@ -273,6 +273,7 @@ where
         let mut flags = ServerTransmissionFlags::HasFlags as u16;
         flags |= ServerTransmissionFlags::WriteZeroes as u16;
         flags |= ServerTransmissionFlags::SendFlush as u16;
+        flags |= ServerTransmissionFlags::CanMultiCon as u16;
         self.con.write_u64(size).await?;
         self.con.write_u16(flags).await?;
 

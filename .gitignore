@@ -2,3 +2,5 @@
 Cargo.lock
 
 *.db
+*.svg
+perf*
