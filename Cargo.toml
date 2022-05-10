@@ -7,18 +7,15 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
+
 [dependencies]
-tokio = { version = "0.2", features = ["full"] }
+tokio = { version = "1", features = ["full"] }
 log = "0.4"
 pretty_env_logger = "0.4"
 # sled = { version = "0.34", features = ["io_uring"] }
 sled = { version = "0.34" }
 async-trait = "0.1"
-reed-solomon-erasure = { version = "4.0", features = ["simd-accel"] }
-itertools = "0.8"
-redis = { version = "0.16", features = ["connection-manager"] }
-r2d2 = "0.8"
-scheduled-thread-pool = "0.2"
+redis = { version = "0.21", features = ["connection-manager", "tokio-comp"] }
 futures = "0.3"
 
 [[bin]]

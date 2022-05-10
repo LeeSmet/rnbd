@@ -1,10 +1,9 @@
 //! This crate provides a wrapper for a client to a 0-db running as a separate process on the same
 //! system. The 0-db must be running in user mode
 
-use redis::RedisError;
+use redis::{RedisConnectionInfo, RedisError};
 
 use async_trait::async_trait;
-use redis::IntoConnectionInfo;
 
 use crate::{Error, Export, ExportStore, NbdError};
 
@@ -43,7 +42,7 @@ impl ExportStore for Zdb {
 #[allow(missing_debug_implementations)]
 #[derive(Clone)]
 pub struct Collection {
-    conn: redis::aio::ConnectionManager,
+    conn: redis::aio::MultiplexedConnection,
 }
 
 const SECTOR_SIZE: u64 = 4 * 1024;
@@ -187,7 +186,7 @@ impl Export for Collection {
 
 impl Zdb {
     pub async fn new(port: u16) -> Zdb {
-        let addr = format!("redis://localhost:{}", port);
+        let addr = format!("localhost:{}", port);
         let default_namespace = Collection::new(addr.clone(), None).await;
         Zdb {
             addr,
@@ -202,10 +201,16 @@ impl Zdb {
 }
 impl Collection {
     async fn new(addr: String, namespace: Option<String>) -> Collection {
-        let mut conn =
-            redis::aio::ConnectionManager::new(addr.clone().into_connection_info().unwrap())
+        let stream = tokio::net::TcpStream::connect(&addr)
+            .await
+            .expect("can create tcp connection to 0-db");
+        let (mut conn, driver) =
+            redis::aio::MultiplexedConnection::new(&RedisConnectionInfo::default(), stream)
                 .await
-                .expect("could not create new connection manager");
+                .expect("can create multiplexed connection to 0-db");
+        // Permanently poll the driver, TODO: is this good enough?
+        tokio::spawn(driver);
+
         if let Some(ref ns) = namespace {
             let namespaces: Vec<String> =
                 redis::cmd("NSLIST").query_async(&mut conn).await.unwrap();
@@ -257,8 +262,8 @@ impl From<RedisError> for NbdError {
     }
 }
 
-impl From<r2d2::Error> for NbdError {
-    fn from(_: r2d2::Error) -> Self {
-        NbdError::Io
-    }
-}
+// impl From<r2d2::Error> for NbdError {
+//     fn from(_: r2d2::Error) -> Self {
+//         NbdError::Io
+//     }
+// }

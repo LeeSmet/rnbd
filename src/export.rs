@@ -28,7 +28,7 @@ pub trait Export {
     type Error: Into<NbdError>;
 
     async fn read(&mut self, start: u64, end: u64) -> Result<Vec<u8>, Self::Error>;
-    async fn write(&mut self, start: u64, data: Vec<u8>) -> Result<(), Self::Error>;
+    async fn write(&mut self, start: u64, data: &[u8]) -> Result<(), Self::Error>;
     async fn flush(&mut self) -> Result<(), Self::Error>;
     async fn trim(&mut self) -> Result<(), Self::Error>; // TODO
     async fn cache(&mut self) -> Result<(), Self::Error>; // TODO
@@ -51,7 +51,7 @@ where
         Ok(contents)
     }
 
-    async fn write(&mut self, start: u64, data: Vec<u8>) -> Result<(), Self::Error> {
+    async fn write(&mut self, start: u64, data: &[u8]) -> Result<(), Self::Error> {
         self.seek(SeekFrom::Start(start)).await?;
         Ok(self.write_all(&data).await?)
     }
@@ -96,7 +96,7 @@ impl ExportStore for TmpStore {
     }
 
     async fn get_export(&self, name: &str) -> Result<Option<Self::Export>, Self::Error> {
-        let mut export = tokio::fs::OpenOptions::new()
+        let export = tokio::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -196,7 +196,7 @@ impl Export for SledExport {
         Ok(data)
     }
 
-    async fn write(&mut self, start: u64, data: Vec<u8>) -> Result<(), Self::Error> {
+    async fn write(&mut self, start: u64, data: &[u8]) -> Result<(), Self::Error> {
         let mut data = data;
         let mut start_sector = start / SECTOR_SIZE;
         let end_sector = (start + data.len() as u64) / SECTOR_SIZE;
@@ -220,13 +220,13 @@ impl Export for SledExport {
                 SECTOR_SIZE as usize
             };
             let (new_data, data_rest) = data.split_at(boundary - (start % SECTOR_SIZE) as usize);
-            data = data_rest;
             let mut block = start_block
                 .clone()
                 .into_iter()
                 .take((start % SECTOR_SIZE) as usize)
                 .collect::<Vec<_>>();
             block.extend_from_slice(new_data);
+            data = data_rest;
             if single_sector_write {
                 block.extend(start_block.into_iter().skip(boundary));
             }

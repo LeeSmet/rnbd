@@ -4,7 +4,7 @@ use tokio::net::TcpListener;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pretty_env_logger::init();
-    let mut listener = TcpListener::bind("127.0.0.1:10809").await?;
+    let listener = TcpListener::bind("127.0.0.1:10809").await?;
 
     //     let db1 = sled::open("test1.db")?;
     //     let db2 = sled::open("test2.db")?;
@@ -24,8 +24,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //         SledStore::new(db5),
     //     ]);
 
+    log::trace!("store created");
+
     loop {
         let (socket, _) = listener.accept().await?;
+
+        log::trace!("connection accepted");
 
         //let hs = rnbd::HandshakeCon::new(socket, rse_store.clone());
         let hs = rnbd::HandshakeCon::new(socket, store.clone());

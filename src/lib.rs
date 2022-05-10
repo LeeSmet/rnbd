@@ -6,8 +6,7 @@ pub mod export;
 pub mod zdb_aio;
 
 use log::{debug, error, info, trace, warn};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::prelude::*;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use std::convert::{TryFrom, TryInto};
 
