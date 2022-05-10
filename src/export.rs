@@ -2,6 +2,11 @@ use async_trait::async_trait;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
+// use reed_solomon_erasure::galois_8::ReedSolomon;
+// use reed_solomon_erasure::shards;
+
+// use itertools::izip;
+
 use std::io::SeekFrom;
 
 use super::Error;
@@ -23,7 +28,7 @@ pub trait Export {
     type Error: Into<NbdError>;
 
     async fn read(&mut self, start: u64, end: u64) -> Result<Vec<u8>, Self::Error>;
-    async fn write(&mut self, start: u64, data: &[u8]) -> Result<(), Self::Error>;
+    async fn write(&mut self, start: u64, data: Vec<u8>) -> Result<(), Self::Error>;
     async fn flush(&mut self) -> Result<(), Self::Error>;
     async fn trim(&mut self) -> Result<(), Self::Error>; // TODO
     async fn cache(&mut self) -> Result<(), Self::Error>; // TODO
@@ -46,9 +51,9 @@ where
         Ok(contents)
     }
 
-    async fn write(&mut self, start: u64, data: &[u8]) -> Result<(), Self::Error> {
+    async fn write(&mut self, start: u64, data: Vec<u8>) -> Result<(), Self::Error> {
         self.seek(SeekFrom::Start(start)).await?;
-        Ok(self.write_all(data).await?)
+        Ok(self.write_all(&data).await?)
     }
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
@@ -191,7 +196,7 @@ impl Export for SledExport {
         Ok(data)
     }
 
-    async fn write(&mut self, start: u64, data: &[u8]) -> Result<(), Self::Error> {
+    async fn write(&mut self, start: u64, data: Vec<u8>) -> Result<(), Self::Error> {
         let mut data = data;
         let mut start_sector = start / SECTOR_SIZE;
         let end_sector = (start + data.len() as u64) / SECTOR_SIZE;
@@ -295,3 +300,163 @@ impl From<sled::Error> for NbdError {
         }
     }
 }
+
+// #[derive(Debug, Clone)]
+// pub struct ErasureExportStore<T> {
+//     backend_stores: Vec<T>, // TODO
+// }
+//
+// impl<T> ErasureExportStore<T>
+// where
+//     T: ExportStore,
+// {
+//     pub fn new(backend_stores: Vec<T>) -> Self {
+//         // only 5 backends allowed for now
+//         assert!(backend_stores.len() == 5);
+//         ErasureExportStore { backend_stores }
+//     }
+// }
+//
+// #[async_trait]
+// impl<T> ExportStore for ErasureExportStore<T>
+// where
+//     T: ExportStore + Send + Sync,
+//     T::Export: Export + Send + Sync,
+// {
+//     type Export = ErasureExport<T::Export>;
+//     type Error = T::Error;
+//
+//     async fn list_exports(&self) -> Result<Vec<String>, Self::Error> {
+//         self.backend_stores[0].list_exports().await
+//     }
+//
+//     async fn get_export(&self, name: &str) -> Result<Option<Self::Export>, Self::Error> {
+//         // TODO
+//         let mut backends = Vec::with_capacity(self.backend_stores.len());
+//         for backend_store in &self.backend_stores {
+//             if let Some(backend) = backend_store.get_export(name).await? {
+//                 backends.push(backend);
+//             }
+//         }
+//         Ok(Some(ErasureExport::new(backends)))
+//     }
+// }
+//
+// #[derive(Debug)]
+// pub struct ErasureExport<T> {
+//     backends: Vec<T>,
+// }
+//
+// impl<T> ErasureExport<T>
+// where
+//     T: Export,
+// {
+//     pub fn new(backends: Vec<T>) -> Self {
+//         // only allow 5 shards for now
+//         assert!(backends.len() == 5);
+//         ErasureExport { backends }
+//     }
+// }
+//
+// #[async_trait]
+// impl<T> Export for ErasureExport<T>
+// where
+//     T: Export + Send + Sync,
+// {
+//     type Error = T::Error;
+//
+//     async fn read(&mut self, start: u64, end: u64) -> Result<Vec<u8>, Self::Error> {
+//         let r = ReedSolomon::new(4, 1).unwrap();
+//
+//         let mut shards: Vec<Vec<u8>> = Vec::with_capacity(5);
+//
+//         for backend in &mut self.backends {
+//             shards.push(backend.read(start, end).await?);
+//         }
+//
+//         // r.reconstruct(&mut shards).unwrap();
+//
+//         let mut res: Vec<u8> = Vec::with_capacity(shards[0].len() * 4);
+//
+//         for (a, b, c, d) in izip!(&shards[0], &shards[1], &shards[2], &shards[3]) {
+//             res.extend_from_slice(&[a.clone(), b.clone(), c.clone(), d.clone()]);
+//         }
+//
+//         Ok(res)
+//     }
+//
+//     async fn write(&mut self, start: u64, data: &[u8]) -> Result<(), Self::Error> {
+//         let r = ReedSolomon::new(4, 1).unwrap();
+//         // oops
+//         assert!(data.len() % 4 == 0);
+//         // TODO: remove this garbage
+//         let vec1 = data
+//             .iter()
+//             .enumerate()
+//             .filter(|(idx, _)| idx % 4 == 0)
+//             .map(|(_, b)| b.clone())
+//             .collect();
+//         let vec2 = data
+//             .iter()
+//             .enumerate()
+//             .filter(|(idx, _)| idx % 4 == 1)
+//             .map(|(_, b)| b.clone())
+//             .collect();
+//         let vec3 = data
+//             .iter()
+//             .enumerate()
+//             .filter(|(idx, _)| idx % 4 == 2)
+//             .map(|(_, b)| b.clone())
+//             .collect();
+//         let vec4 = data
+//             .iter()
+//             .enumerate()
+//             .filter(|(idx, _)| idx % 4 == 3)
+//             .map(|(_, b)| b.clone())
+//             .collect();
+//
+//         let parity = Vec::with_capacity(data.len() / 4);
+//
+//         let mut shards = vec![vec1, vec2, vec3, vec4, parity];
+//
+//         r.encode(&mut shards).unwrap();
+//
+//         for (idx, backend) in self.backends.iter_mut().enumerate() {
+//             backend.write(start, &shards[idx]).await?;
+//         }
+//
+//         Ok(())
+//     }
+//
+//     async fn flush(&mut self) -> Result<(), Self::Error> {
+//         for backend in &mut self.backends {
+//             backend.flush().await?;
+//         }
+//         Ok(())
+//     }
+//
+//     async fn trim(&mut self) -> Result<(), Self::Error> {
+//         unimplemented!();
+//         // self.backends[0].trim().await
+//     }
+//
+//     async fn cache(&mut self) -> Result<(), Self::Error> {
+//         unimplemented!();
+//         // self.backends[0].cache().await
+//     }
+//
+//     async fn write_zeroes(&mut self, start: u64, end: u64) -> Result<(), Self::Error> {
+//         unimplemented!();
+//         // self.backends[0].write_zeroes(start, end).await
+//     }
+//
+//     async fn block_status(&mut self) -> Result<(), Self::Error> {
+//         unimplemented!();
+//         // self.backends[0].block_status().await
+//     } // TODO
+//
+//     async fn resize(&mut self) -> Result<(), Self::Error> {
+//         unimplemented!();
+//         // self.backends[0].resize().await
+//     } // TODO
+// }

@@ -2,6 +2,8 @@
 #![deny(missing_debug_implementations)]
 
 pub mod export;
+// pub mod zdb;
+pub mod zdb_aio;
 
 use log::{debug, error, info, trace, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -239,6 +241,7 @@ where
                             let mut request_vec: Vec<InfoType> =
                                 Vec::with_capacity(request_count as usize);
                             for idx in 0..request_count {
+                                trace!("try to decode stuff");
                                 request_vec.push(
                                     u16::from_be_bytes(
                                         data[idx as usize * 2..(idx + 1) as usize * 2]
@@ -250,7 +253,23 @@ where
                             for it in &request_vec {
                                 trace!("{:?}", it);
                             }
-                            self.write_unsupported_option(opt).await?;
+                            let export = self
+                                .export_store
+                                .get_export(&name)
+                                .await
+                                .map_err(|e| e.into())?;
+                            // TODO: find good way to handle this
+                            self.write_info_export(
+                                opt,
+                                1024 * 1024 * 1024,
+                                self.transmission_flags(),
+                            )
+                            .await?;
+                            //self.write_info_block_size(opt, 1, 4096, u32::MAX).await?;
+                            self.write_info_block_size(opt, 1, 4096, 4096).await?;
+                            self.write_opt_ack(opt).await?;
+                            return Ok(Some(ExportCon::new(self, export.unwrap())));
+                            // self.write_unsupported_option(opt).await?;
                         }
                         Options::StructuredReply => self.write_unsupported_option(opt).await?,
                         Options::MetaContext => self.write_unsupported_option(opt).await?,
@@ -269,18 +288,43 @@ where
     }
 
     async fn write_opt_export_reply(&mut self, size: u64) -> Result<(), Error> {
-        // TODO proper flaggies
-        let mut flags = ServerTransmissionFlags::HasFlags as u16;
-        flags |= ServerTransmissionFlags::WriteZeroes as u16;
-        flags |= ServerTransmissionFlags::SendFlush as u16;
-        flags |= ServerTransmissionFlags::CanMultiCon as u16;
         self.con.write_u64(size).await?;
-        self.con.write_u16(flags).await?;
+        self.con.write_u16(self.transmission_flags()).await?;
 
         if self.write_zeroes {
             self.con.write_all(&[0u8; 124]).await?;
         }
 
+        Ok(())
+    }
+
+    async fn write_info_export(
+        &mut self,
+        opt: Options,
+        size: u64,
+        flags: u16,
+    ) -> Result<(), Error> {
+        self.write_opt_reply_header(opt, OptionsReply::Info, 12)
+            .await?;
+        self.con.write_u16(InfoType::Export as u16).await?;
+        self.con.write_u64(size).await?;
+        self.con.write_u16(flags).await?;
+        Ok(())
+    }
+
+    async fn write_info_block_size(
+        &mut self,
+        opt: Options,
+        min_size: u32,
+        prefered_size: u32,
+        max_size: u32,
+    ) -> Result<(), Error> {
+        self.write_opt_reply_header(opt, OptionsReply::Info, 14)
+            .await?;
+        self.con.write_u16(InfoType::BlockSize as u16).await?;
+        self.con.write_u32(min_size).await?;
+        self.con.write_u32(prefered_size).await?;
+        self.con.write_u32(max_size).await?;
         Ok(())
     }
 
@@ -326,6 +370,15 @@ where
         self.con.write_u32(optreply as u32).await?;
         self.con.write_u32(len).await?;
         Ok(())
+    }
+
+    fn transmission_flags(&self) -> u16 {
+        // TODO proper flaggies
+        let mut flags = ServerTransmissionFlags::HasFlags as u16;
+        flags |= ServerTransmissionFlags::WriteZeroes as u16;
+        flags |= ServerTransmissionFlags::SendFlush as u16;
+        flags |= ServerTransmissionFlags::CanMultiCon as u16;
+        flags
     }
 }
 
