@@ -61,7 +61,7 @@ impl Export for Collection {
                 &self
                     .get(sector)
                     .await?
-                    .or(Some(vec![0; SECTOR_SIZE as usize].into()))
+                    .or_else(|| Some(vec![0; SECTOR_SIZE as usize]))
                     .map(|v| {
                         // drop first bytes of the first sector
                         if sector == start_sector {
@@ -105,7 +105,7 @@ impl Export for Collection {
             let start_block = self
                 .get(start_sector)
                 .await?
-                .or(Some(vec![0u8; SECTOR_SIZE as usize]))
+                .or_else(|| Some(vec![0u8; SECTOR_SIZE as usize]))
                 .unwrap();
             let boundary = if single_sector_write {
                 ((start + data.len() as u64) % SECTOR_SIZE) as usize
@@ -141,7 +141,7 @@ impl Export for Collection {
             let last_sector_data = self
                 .get(end_sector)
                 .await?
-                .or(Some(vec![0u8; SECTOR_SIZE as usize]))
+                .or_else(|| Some(vec![0u8; SECTOR_SIZE as usize]))
                 .unwrap();
             // boundary in the block, past here we need to extend from the read data
             let boundary = (data.len() as u64 % SECTOR_SIZE) as usize;
@@ -169,7 +169,7 @@ impl Export for Collection {
         Err(NbdError::NotSup)
     }
 
-    async fn write_zeroes(&mut self, start: u64, end: u64) -> Result<(), Self::Error> {
+    async fn write_zeroes(&mut self, _start: u64, _end: u64) -> Result<(), Self::Error> {
         Err(NbdError::NotSup)
     }
 

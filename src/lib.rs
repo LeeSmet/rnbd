@@ -195,7 +195,7 @@ where
                                 // TODO: invalid
                             }
                             let (name_bytes, data) = data.split_at(name_length as usize);
-                            let name = String::from_utf8(name_bytes.to_vec())?;
+                            let _name = String::from_utf8(name_bytes.to_vec())?;
                             let (request_count_bytes, data) = data.split_at(2);
                             let request_count = u16::from_be_bytes(request_count_bytes.try_into()?);
                             if data.len() != request_count as usize * 2 {
@@ -328,9 +328,7 @@ where
     }
 
     async fn write_opt_ack(&mut self, opt: Options) -> Result<(), Error> {
-        Ok(self
-            .write_opt_reply_header(opt, OptionsReply::Ack, 0)
-            .await?)
+        self.write_opt_reply_header(opt, OptionsReply::Ack, 0).await
     }
 
     async fn write_opt_server_rep(&mut self, opt: Options, name: &str) -> Result<(), Error> {
@@ -346,16 +344,14 @@ where
     }
 
     async fn write_opt_err_invalid(&mut self, opt: Options) -> Result<(), Error> {
-        Ok(self
-            .write_opt_reply_header(opt, OptionsReply::ErrInvalid, 0)
-            .await?)
+        self.write_opt_reply_header(opt, OptionsReply::ErrInvalid, 0)
+            .await
     }
 
     async fn write_unsupported_option(&mut self, opt: Options) -> Result<(), Error> {
         trace!("writing \"unsupported option\" to client");
-        Ok(self
-            .write_opt_reply_header(opt, OptionsReply::ErrUnsup, 0)
-            .await?)
+        self.write_opt_reply_header(opt, OptionsReply::ErrUnsup, 0)
+            .await
     }
 
     async fn write_opt_reply_header(
@@ -811,7 +807,7 @@ pub enum NbdError {
 }
 
 impl From<std::io::Error> for NbdError {
-    fn from(e: std::io::Error) -> NbdError {
+    fn from(_: std::io::Error) -> NbdError {
         NbdError::Io
     }
 }

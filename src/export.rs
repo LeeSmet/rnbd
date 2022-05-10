@@ -53,7 +53,7 @@ where
 
     async fn write(&mut self, start: u64, data: &[u8]) -> Result<(), Self::Error> {
         self.seek(SeekFrom::Start(start)).await?;
-        Ok(self.write_all(&data).await?)
+        Ok(self.write_all(data).await?)
     }
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
@@ -165,7 +165,7 @@ impl Export for SledExport {
                 &self
                     .db
                     .get(sector.to_be_bytes())?
-                    .or(Some(vec![0; SECTOR_SIZE as usize].into()))
+                    .or_else(|| Some(vec![0; SECTOR_SIZE as usize].into()))
                     .map(|v| {
                         // drop first bytes of the first sector
                         if sector == start_sector {
@@ -211,8 +211,8 @@ impl Export for SledExport {
             let start_block = self
                 .db
                 .get(start_sector.to_be_bytes())?
-                .and_then(|v| Some(Vec::from(&*v)))
-                .or(Some(vec![0u8; SECTOR_SIZE as usize]))
+                .map(|v| Vec::from(&*v))
+                .or_else(|| Some(vec![0u8; SECTOR_SIZE as usize]))
                 .unwrap();
             let boundary = if single_sector_write {
                 ((start + data.len() as u64) % SECTOR_SIZE) as usize
@@ -248,8 +248,8 @@ impl Export for SledExport {
             let last_sector_data = self
                 .db
                 .get(end_sector.to_be_bytes())?
-                .and_then(|v| Some(Vec::from(&*v)))
-                .or(Some(vec![0u8; SECTOR_SIZE as usize]))
+                .map(|v| Vec::from(&*v))
+                .or_else(|| Some(vec![0u8; SECTOR_SIZE as usize]))
                 .unwrap();
             // boundary in the block, past here we need to extend from the read data
             let boundary = (data.len() as u64 % SECTOR_SIZE) as usize;
@@ -275,7 +275,7 @@ impl Export for SledExport {
         Err(NbdError::NotSup)
     }
 
-    async fn write_zeroes(&mut self, start: u64, end: u64) -> Result<(), Self::Error> {
+    async fn write_zeroes(&mut self, _start: u64, _end: u64) -> Result<(), Self::Error> {
         Err(NbdError::NotSup)
         //self.seek(SeekFrom::Start(start)).await?;
         //let data = vec![0u8; (start - end) as usize];
